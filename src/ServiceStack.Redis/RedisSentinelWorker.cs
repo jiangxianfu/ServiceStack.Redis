@@ -19,19 +19,23 @@ namespace ServiceStack.Redis
         private string host;
         private IRedisClientsManager redisManager;
 
-        public event EventHandler SentinelError;
+        public Action<Exception> OnSentinelError;
 
         public RedisSentinelWorker(RedisSentinel redisSentinel, string host, string sentinelName)
         {
+
             this.redisSentinel = redisSentinel;
-            this.redisManager = redisSentinel.redisManager;
+            this.redisManager = redisSentinel.RedisManager;
             this.sentinelName = sentinelName;
-            this.sentinelClient = new RedisClient(host);
-            this.sentinelPubSubClient = new RedisClient(host);
+
+            //Sentinel Servers doesn't support DB, reset to 0
+            this.sentinelClient = new RedisClient(host) { Db = 0 };
+            this.sentinelPubSubClient = new RedisClient(host) { Db = 0 };
             this.sentinelSubscription = this.sentinelPubSubClient.CreateSubscription();
             this.sentinelSubscription.OnMessage = SentinelMessageReceived;
 
-            Log.Info("Set up Redis Sentinel on {0}".Fmt(host));
+            if (Log.IsDebugEnabled)
+                Log.Debug("Set up Redis Sentinel on {0}".Fmt(host));
         }
 
         private void SubscribeForChanges(object arg)
@@ -41,14 +45,13 @@ namespace ServiceStack.Redis
                 // subscribe to all messages
                 this.sentinelSubscription.SubscribeToChannelsMatching("*");
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                Log.Error("Problem Subscribing to Redis Channel on {0}:{1}".Fmt(this.sentinelClient.Host, this.sentinelClient.Port));
-                // problem communicating to sentinel
-                if (SentinelError != null)
-                {
-                    SentinelError(this, EventArgs.Empty);
-                }
+                Log.Error("Error Subscribing to Redis Channel on {0}:{1}"
+                    .Fmt(this.sentinelClient.Host, this.sentinelClient.Port), ex);
+
+                if (OnSentinelError != null)
+                    OnSentinelError(ex);
             }
         }
 
@@ -59,6 +62,9 @@ namespace ServiceStack.Redis
         /// <param name="message"></param>
         private void SentinelMessageReceived(string channel, string message)
         {
+            if (Log.IsDebugEnabled)
+                Log.Debug("Received '{0}' on channel '{1}' from Sentinel".Fmt(channel, message));
+
             // {+|-}sdown is the event for server coming up or down
             if (channel.ToLower().Contains("sdown"))
             {
@@ -66,26 +72,44 @@ namespace ServiceStack.Redis
 
                 ConfigureRedisFromSentinel();
             }
+
+            if (redisSentinel.OnSentinelMessageReceived != null)
+                redisSentinel.OnSentinelMessageReceived(channel, message);
         }
 
         /// <summary>
         /// Does a sentinel check for masters and slaves and either sets up or fails over to the new config
         /// </summary>
-        private void ConfigureRedisFromSentinel()
+        internal SentinelInfo ConfigureRedisFromSentinel()
         {
-            Log.Info("Configuring Redis Clients");
-
-            var masters = ConvertMasterArrayToList(this.sentinelClient.Sentinel("master", this.sentinelName));
-            var slaves = ConvertSlaveArrayToList(this.sentinelClient.Sentinel("slaves", this.sentinelName));
+            var sentinelInfo = new SentinelInfo(
+                ConvertMasterArrayToList(this.sentinelClient.Sentinel("master", this.sentinelName)),
+                ConvertSlaveArrayToList(this.sentinelClient.Sentinel("slaves", this.sentinelName)));
 
             if (redisManager == null)
             {
-                redisManager = redisSentinel.RedisManagerFactory.Create(masters, slaves);
+                Log.Info("Configuring initial Redis Clients: {0}".Fmt(sentinelInfo));
+
+                redisManager = redisSentinel.RedisManagerFactory.Create(
+                    redisSentinel.ConfigureHosts(sentinelInfo.RedisMasters),
+                    redisSentinel.ConfigureHosts(sentinelInfo.RedisSlaves));
+
+                var canFailover = redisManager as IRedisFailover;
+                if (canFailover != null && this.redisSentinel.OnFailover != null)
+                {
+                    canFailover.OnFailover.Add(this.redisSentinel.OnFailover);
+                }
             }
             else
             {
-                ((IRedisFailover)redisManager).FailoverTo(masters, slaves);
+                Log.Info("Failing over to Redis Clients: {0}".Fmt(sentinelInfo));
+
+                ((IRedisFailover)redisManager).FailoverTo(
+                    redisSentinel.ConfigureHosts(sentinelInfo.RedisMasters),
+                    redisSentinel.ConfigureHosts(sentinelInfo.RedisSlaves));
             }
+
+            return sentinelInfo;
         }
 
         private Dictionary<string, string> ParseDataArray(object[] items)

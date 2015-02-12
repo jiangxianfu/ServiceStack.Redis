@@ -158,6 +158,12 @@ namespace ServiceStack.Redis
             {
                 for (var i = 0; i < readClients.Length; i++)
                 {
+                    var redis = readClients[i];
+                    if (redis != null)
+                    {
+                        redis.DisposeConnection();
+                    }
+
                     readClients[i] = null;
                 }
                 ReadOnlyHosts = readOnlyHosts.ToRedisEndPoints();
@@ -167,6 +173,12 @@ namespace ServiceStack.Redis
             {
                 for (var i = 0; i < writeClients.Length; i++)
                 {
+                    var redis = writeClients[i];
+                    if (redis != null)
+                    {
+                        redis.DisposeConnection();
+                    }
+
                     writeClients[i] = null;
                 }
                 ReadWriteHosts = readWriteHosts.ToRedisEndPoints();
@@ -357,7 +369,15 @@ namespace ServiceStack.Redis
                 {
                     var readClient = readClients[i];
                     if (client != readClient) continue;
-                    client.Active = false;
+                    if (client.IsDisposed)
+                    {
+                        readClients[i] = null;
+                    }
+                    else
+                    {
+                        client.Active = false;
+                    }
+
                     Monitor.PulseAll(readClients);
                     return;
                 }
@@ -369,7 +389,15 @@ namespace ServiceStack.Redis
                 {
                     var writeClient = writeClients[i];
                     if (client != writeClient) continue;
-                    client.Active = false;
+                    if (client.IsDisposed)
+                    {
+                        writeClients[i] = null;
+                    }
+                    else
+                    {
+                        client.Active = false;
+                    }
+
                     Monitor.PulseAll(writeClients);
                     return;
                 }

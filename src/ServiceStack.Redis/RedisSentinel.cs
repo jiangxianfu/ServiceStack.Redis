@@ -8,11 +8,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using ServiceStack;
+using ServiceStack.Logging;
 
 namespace ServiceStack.Redis
 {
     public class RedisSentinel : IRedisSentinel
     {
+        protected static readonly ILog Log = LogManager.GetLogger(typeof(RedisSentinel));
+
         public RedisManagerFactory RedisManagerFactory { get; set; }
 
         private readonly string sentinelName;
@@ -20,56 +24,87 @@ namespace ServiceStack.Redis
         private int sentinelIndex = -1;
         private List<string> sentinels;
         private RedisSentinelWorker worker;
-        internal IRedisClientsManager redisManager;
         private static int MaxFailures = 5;
+
+        public IRedisClientsManager RedisManager { get; set; }
+        public Action<IRedisClientsManager> OnFailover { get; set; }
+        public Action<Exception> OnWorkerError { get; set; }
+        public Action<string, string> OnSentinelMessageReceived { get; set; }
+
+        public RedisSentinel(string sentinelHost, string sentinelName)
+            : this(new[] { sentinelHost }, sentinelName) { }
 
         public RedisSentinel(IEnumerable<string> sentinelHosts, string sentinelName)
         {
             this.sentinels = sentinelHosts != null ? sentinelHosts.ToList() : null;
-            if (sentinelHosts == null || sentinels.Count == 0) 
+            if (sentinelHosts == null || sentinels.Count == 0)
                 throw new ArgumentException("sentinels must have at least one entry");
 
             this.sentinelName = sentinelName;
             this.RedisManagerFactory = new RedisManagerFactory();
         }
 
-        /// <summary>
-        /// Initialize channel and register client manager
-        /// </summary>
-        /// <param name="container"></param>
+        [Obsolete("Use Start()")]
         public IRedisClientsManager Setup()
+        {
+            return Start();
+        }
+
+        /// <summary>
+        /// Initialize Sentinel Subscription and Configure Redis ClientsManager
+        /// </summary>
+        public IRedisClientsManager Start()
         {
             GetValidSentinel();
 
-            if (this.redisManager == null)
-            {
+            if (this.RedisManager == null)
                 throw new ApplicationException("Unable to resolve sentinels!");
-            }
 
-            return this.redisManager;
+            return this.RedisManager;
         }
 
-        private void GetValidSentinel()
+        public Func<string, string> HostFilter { get; set; }
+
+        internal string[] ConfigureHosts(IEnumerable<string> hosts)
         {
-            while (this.redisManager == null && ShouldRetry())
+            if (hosts == null)
+                return new string[0];
+
+            return HostFilter == null
+                ? hosts.ToArray()
+                : hosts.Map(HostFilter).ToArray();
+        }
+
+        private RedisSentinelWorker GetValidSentinel()
+        {
+            if (this.worker != null)
+                return this.worker;
+
+            RedisException lastEx = null;
+
+            while (this.RedisManager == null && ShouldRetry())
             {
                 try
                 {
                     this.worker = GetNextSentinel();
-                    this.redisManager = worker.GetClientManager();
+                    this.RedisManager = worker.GetClientManager();
                     this.worker.BeginListeningForConfigurationChanges();
+                    return this.worker;
                 }
-                catch (RedisException)
+                catch (RedisException ex)
                 {
+                    if (OnWorkerError != null)
+                        OnWorkerError(ex);
+
+                    lastEx = ex;
                     if (this.worker != null)
-                    {
-                        this.worker.SentinelError -= Worker_SentinelError;
                         this.worker.Dispose();
-                    }
 
                     this.failures++;
                 }
             }
+
+            throw new RedisException("RedisSentinel is not accessible", lastEx);
         }
 
         /// <summary>
@@ -87,13 +122,13 @@ namespace ServiceStack.Redis
             sentinelIndex++;
 
             if (sentinelIndex >= sentinels.Count)
-            {
                 sentinelIndex = 0;
-            }
 
-            var sentinelWorker = new RedisSentinelWorker(this, sentinels[sentinelIndex], this.sentinelName);
+            var sentinelWorker = new RedisSentinelWorker(this, sentinels[sentinelIndex], this.sentinelName)
+            {
+                OnSentinelError = OnSentinelError
+            };
 
-            sentinelWorker.SentinelError += Worker_SentinelError;
             return sentinelWorker;
         }
 
@@ -102,15 +137,17 @@ namespace ServiceStack.Redis
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
-        private void Worker_SentinelError(object sender, EventArgs e)
+        private void OnSentinelError(Exception ex)
         {
-            var worker = sender as RedisSentinelWorker;
-
-            if (worker != null)
+            if (this.worker != null)
             {
+                Log.Error("Error on existing SentinelWorker, reconnecting...");
+
+                if (OnWorkerError != null)
+                    OnWorkerError(ex);
+
                 // dispose the worker
-                worker.SentinelError -= Worker_SentinelError;
-                worker.Dispose();
+                this.worker.Dispose();
 
                 // get a new worker and start looking for more changes
                 this.worker = GetNextSentinel();
@@ -118,14 +155,35 @@ namespace ServiceStack.Redis
             }
         }
 
+        public SentinelInfo FailoverToSentinelHosts()
+        {
+            return GetValidSentinel().ConfigureRedisFromSentinel();
+        }
+
         public void Dispose()
         {
             if (worker != null)
             {
-                worker.SentinelError -= Worker_SentinelError;
                 worker.Dispose();
                 worker = null;
             }
         }
+    }
+}
+
+public class SentinelInfo
+{
+    public string[] RedisMasters { get; set; }
+    public string[] RedisSlaves { get; set; }
+
+    public SentinelInfo(List<string> redisMasters, List<string> redisSlaves)
+    {
+        RedisMasters = redisMasters != null ? redisMasters.ToArray() : new string[0];
+        RedisSlaves = redisSlaves != null ? redisSlaves.ToArray() : new string[0];
+    }
+
+    public override string ToString()
+    {
+        return "masters: {0}, slaves: {1}".Fmt(RedisMasters, RedisSlaves);
     }
 }

@@ -83,6 +83,12 @@ namespace ServiceStack.Redis
             {
                 for (var i = 0; i < clients.Length; i++)
                 {
+                    var redis = clients[i];
+                    if (redis != null)
+                    {
+                        redis.DisposeConnection();
+                    }
+
                     clients[i] = null;
                 }
                 Hosts = readWriteHosts.ToRedisEndPoints();
@@ -200,7 +206,16 @@ namespace ServiceStack.Redis
                 {
                     var writeClient = clients[i];
                     if (client != writeClient) continue;
-                    client.Active = false;
+                    if (client.IsDisposed)
+                    {
+                        clients[i] = null;
+                    }
+                    else
+                    {
+                        client.Active = false;
+                    }
+
+                    Monitor.PulseAll(clients);
                     return;
                 }
             }

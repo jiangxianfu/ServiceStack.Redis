@@ -10,8 +10,10 @@ namespace ServiceStack.Redis
             Host = RedisNativeClient.DefaultHost;
             Port = RedisNativeClient.DefaultPort;
             Db = RedisNativeClient.DefaultDb;
-
-            ConnectTimeout = 0;
+            //个性化定制
+            //ConnectTimeout = 0;
+            //姜贤富 设置timeout--2015-02-12
+            ConnectTimeout = 100;
             SendTimeout = -1;
             ReceiveTimeout = -1;
             IdleTimeOutSecs = RedisNativeClient.DefaultIdleTimeOutSecs;
