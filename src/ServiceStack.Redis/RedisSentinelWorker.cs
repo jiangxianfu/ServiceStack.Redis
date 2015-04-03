@@ -66,7 +66,7 @@ namespace ServiceStack.Redis
                 Log.Debug("Received '{0}' on channel '{1}' from Sentinel".Fmt(channel, message));
 
             // {+|-}sdown is the event for server coming up or down
-            if (channel.ToLower().Contains("sdown"))
+            if ((channel == "+failover-end") || channel.ToLower().Contains("sdown"))
             {
                 Log.Info("Sentinel detected server down/up with message:{0}".Fmt(message));
 
@@ -82,9 +82,7 @@ namespace ServiceStack.Redis
         /// </summary>
         internal SentinelInfo ConfigureRedisFromSentinel()
         {
-            var sentinelInfo = new SentinelInfo(
-                ConvertMasterArrayToList(this.sentinelClient.Sentinel("master", this.sentinelName)),
-                ConvertSlaveArrayToList(this.sentinelClient.Sentinel("slaves", this.sentinelName)));
+            var sentinelInfo = GetSentinelInfo();
 
             if (redisManager == null)
             {
@@ -109,6 +107,14 @@ namespace ServiceStack.Redis
                     redisSentinel.ConfigureHosts(sentinelInfo.RedisSlaves));
             }
 
+            return sentinelInfo;
+        }
+
+        internal SentinelInfo GetSentinelInfo()
+        {
+            var sentinelInfo = new SentinelInfo(
+                ConvertMasterArrayToList(this.sentinelClient.Sentinel("master", this.sentinelName)),
+                ConvertSlaveArrayToList(this.sentinelClient.Sentinel("slaves", this.sentinelName)));
             return sentinelInfo;
         }
 
