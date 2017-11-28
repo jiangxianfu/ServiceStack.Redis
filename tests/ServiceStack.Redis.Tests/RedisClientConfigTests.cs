@@ -9,6 +9,7 @@ namespace ServiceStack.Redis.Tests
     public class RedisClientConfigTests
         : RedisClientTestsBase
     {
+        [Explicit("Hurts MSOpenTech Redis Server")]
         [Test]
         public void Can_Set_and_Get_Config()
         {
@@ -74,7 +75,7 @@ namespace ServiceStack.Redis.Tests
             Redis.KillClients(ofType: RedisClientType.PubSub);
             Redis.KillClients(ofType: RedisClientType.Slave);
             Redis.KillClients(skipMe: true);
-            Redis.KillClients(fromAddress: "192.168.0.1:6379", withId: "1", ofType:RedisClientType.Normal);
+            Redis.KillClients(fromAddress: "192.168.0.1:6379", withId: "1", ofType: RedisClientType.Normal);
             Redis.KillClients(skipMe: false);
         }
 
@@ -83,6 +84,8 @@ namespace ServiceStack.Redis.Tests
         {
             var result = Redis.Role();
             result.PrintDump();
+            Assert.That(result.Children[0].Text, Is.EqualTo("master"));
+            Assert.That(Redis.GetServerRole(), Is.EqualTo(RedisServerRole.Master));
 
             //needs redis-server v3.0
             //var slave = new RedisClient("10.0.0.9:6380");

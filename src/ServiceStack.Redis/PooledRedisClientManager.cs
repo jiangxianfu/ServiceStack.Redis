@@ -12,9 +12,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Threading;
 using ServiceStack.Caching;
 using ServiceStack.Logging;
+using ServiceStack.Text;
 
 namespace ServiceStack.Redis
 {
@@ -24,7 +27,7 @@ namespace ServiceStack.Redis
     /// 1 master and multiple replicated read slaves.
     /// </summary>
     public partial class PooledRedisClientManager
-        : IRedisClientsManager, IRedisFailover, IHandleClientDispose
+        : IRedisClientsManager, IRedisFailover, IHandleClientDispose, IHasRedisResolver
     {
         private static readonly ILog Log = LogManager.GetLogger(typeof(PooledRedisClientManager));
 
@@ -44,27 +47,24 @@ namespace ServiceStack.Redis
         /// </summary>
         public string NamespacePrefix { get; set; }
 
-        private List<RedisEndpoint> ReadWriteHosts { get; set; }
-        private List<RedisEndpoint> ReadOnlyHosts { get; set; }
+        public IRedisResolver RedisResolver { get; set; }
         public List<Action<IRedisClientsManager>> OnFailover { get; private set; }
 
-        private RedisClient[] writeClients = new RedisClient[0];
+        private RedisClient[] writeClients = TypeConstants<RedisClient>.EmptyArray;
         protected int WritePoolIndex;
 
-        private RedisClient[] readClients = new RedisClient[0];
+        private RedisClient[] readClients = TypeConstants<RedisClient>.EmptyArray;
         protected int ReadPoolIndex;
 
         protected int RedisClientCounter = 0;
 
         protected RedisClientManagerConfig Config { get; set; }
 
-        public IRedisClientFactory RedisClientFactory { get; set; }
-
         public long? Db { get; private set; }
 
         public Action<IRedisNativeClient> ConnectionFilter { get; set; }
 
-        public PooledRedisClientManager() : this(RedisNativeClient.DefaultHost) { }
+        public PooledRedisClientManager() : this(RedisConfig.DefaultHost) { }
 
         public PooledRedisClientManager(int poolSize, int poolTimeOutSeconds, params string[] readWriteHosts)
             : this(readWriteHosts, readWriteHosts, null, null, poolSize, poolTimeOutSeconds)
@@ -120,17 +120,17 @@ namespace ServiceStack.Redis
                 ? config.DefaultDb ?? initalDb
                 : initalDb;
 
-            ReadWriteHosts = readWriteHosts.ToRedisEndPoints();
-            ReadOnlyHosts = readOnlyHosts.ToRedisEndPoints();
+            var masters = (readWriteHosts ?? TypeConstants.EmptyStringArray).ToArray();
+            var slaves = (readOnlyHosts ?? TypeConstants.EmptyStringArray).ToArray();
 
-            this.RedisClientFactory = Redis.RedisClientFactory.Instance;
+            RedisResolver = new RedisResolver(masters, slaves);
 
             this.PoolSizeMultiplier = poolSizeMultiplier ?? 10;
 
             this.Config = config ?? new RedisClientManagerConfig
             {
-                MaxWritePoolSize = ReadWriteHosts.Count * PoolSizeMultiplier,
-                MaxReadPoolSize = ReadOnlyHosts.Count * PoolSizeMultiplier,
+                MaxWritePoolSize = RedisConfig.DefaultMaxPoolSize ?? masters.Length * PoolSizeMultiplier,
+                MaxReadPoolSize = RedisConfig.DefaultMaxPoolSize ?? slaves.Length * PoolSizeMultiplier,
             };
 
             this.OnFailover = new List<Action<IRedisClientsManager>>();
@@ -140,6 +140,7 @@ namespace ServiceStack.Redis
                 ? poolTimeOutSeconds * 1000
                 : 2000; //Default Timeout
 
+            JsConfig.InitStatics();
 
             if (this.Config.AutoStart)
             {
@@ -154,19 +155,19 @@ namespace ServiceStack.Redis
 
         public void FailoverTo(IEnumerable<string> readWriteHosts, IEnumerable<string> readOnlyHosts)
         {
+            Interlocked.Increment(ref RedisState.TotalFailovers);
+
             lock (readClients)
             {
                 for (var i = 0; i < readClients.Length; i++)
                 {
                     var redis = readClients[i];
                     if (redis != null)
-                    {
-                        redis.DisposeConnection();
-                    }
+                        RedisState.DeactivateClient(redis);
 
                     readClients[i] = null;
                 }
-                ReadOnlyHosts = readOnlyHosts.ToRedisEndPoints();
+                RedisResolver.ResetSlaves(readOnlyHosts);
             }
 
             lock (writeClients)
@@ -175,13 +176,11 @@ namespace ServiceStack.Redis
                 {
                     var redis = writeClients[i];
                     if (redis != null)
-                    {
-                        redis.DisposeConnection();
-                    }
+                        RedisState.DeactivateClient(redis);
 
                     writeClients[i] = null;
                 }
-                ReadWriteHosts = readWriteHosts.ToRedisEndPoints();
+                RedisResolver.ResetMasters(readWriteHosts);
             }
 
             if (this.OnFailover != null)
@@ -211,29 +210,236 @@ namespace ServiceStack.Redis
         /// <returns></returns>
         public IRedisClient GetClient()
         {
-            lock (writeClients)
+            try
             {
-                AssertValidReadWritePool();
-
-                RedisClient inActiveClient;
-                while ((inActiveClient = GetInActiveWriteClient()) == null)
+                var poolTimedOut = false;
+                var inactivePoolIndex = -1;
+                lock (writeClients)
                 {
-                    if (PoolTimeout.HasValue)
+                    AssertValidReadWritePool();
+
+                    RedisClient inActiveClient;
+                    while ((inactivePoolIndex = GetInActiveWriteClient(out inActiveClient)) == -1)
                     {
-                        // wait for a connection, cry out if made to wait too long
-                        if (!Monitor.Wait(writeClients, PoolTimeout.Value))
-                            throw new TimeoutException(PoolTimeoutError);
+                        if (PoolTimeout.HasValue)
+                        {
+                            // wait for a connection, cry out if made to wait too long
+                            if (!Monitor.Wait(writeClients, PoolTimeout.Value))
+                            {
+                                poolTimedOut = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            Monitor.Wait(writeClients, RecheckPoolAfterMs);
+                        }
                     }
-                    else
-                        Monitor.Wait(writeClients, RecheckPoolAfterMs);
+
+                    //inActiveClient != null only for Valid InActive Clients
+                    if (inActiveClient != null)
+                    {
+                        WritePoolIndex++;
+                        inActiveClient.Active = true;
+
+                        InitClient(inActiveClient);
+
+                        return inActiveClient;
+                    }
                 }
 
-                WritePoolIndex++;
-                inActiveClient.Active = true;
+                if (poolTimedOut)
+                    throw new TimeoutException(PoolTimeoutError);
 
-                InitClient(inActiveClient);
+                //Reaches here when there's no Valid InActive Clients
+                try
+                {
+                    //inactivePoolIndex = index of reservedSlot || index of invalid client
+                    var existingClient = writeClients[inactivePoolIndex];
+                    if (existingClient != null && existingClient != reservedSlot && existingClient.HadExceptions)
+                    {
+                        RedisState.DeactivateClient(existingClient);
+                    }
 
-                return inActiveClient;
+                    var newClient = InitNewClient(RedisResolver.CreateMasterClient(inactivePoolIndex));
+
+                    //Put all blocking I/O or potential Exceptions before lock
+                    lock (writeClients)
+                    {
+                        //If existingClient at inactivePoolIndex changed (failover) return new client outside of pool
+                        if (writeClients[inactivePoolIndex] != existingClient)
+                        {
+                            if (Log.IsDebugEnabled)
+                                Log.Debug("writeClients[inactivePoolIndex] != existingClient: {0}".Fmt(writeClients[inactivePoolIndex]));
+
+                            return newClient; //return client outside of pool
+                        }
+
+                        WritePoolIndex++;
+                        writeClients[inactivePoolIndex] = newClient;
+                        return newClient;
+                    }
+                }
+                catch
+                {
+                    //Revert free-slot for any I/O exceptions that can throw (before lock)
+                    lock (writeClients)
+                    {
+                        writeClients[inactivePoolIndex] = null; //free slot
+                    }
+                    throw;
+                }
+            }
+            finally
+            {
+                RedisState.DisposeExpiredClients();
+            }
+        }
+
+        class ReservedClient : RedisClient
+        {
+            public ReservedClient()
+            {
+                this.DeactivatedAt = DateTime.UtcNow;
+            }
+
+            public override void Dispose() {}
+        }
+
+        static readonly ReservedClient reservedSlot = new ReservedClient();
+
+        /// <summary>
+        /// Called within a lock
+        /// </summary>
+        /// <returns></returns>
+        private int GetInActiveWriteClient(out RedisClient inactiveClient)
+        {
+            //this will loop through all hosts in readClients once even though there are 2 for loops
+            //both loops are used to try to get the prefered host according to the round robin algorithm
+            var readWriteTotal = RedisResolver.ReadWriteHostsCount;
+            var desiredIndex = WritePoolIndex % writeClients.Length;
+            for (int x = 0; x < readWriteTotal; x++)
+            {
+                var nextHostIndex = (desiredIndex + x) % readWriteTotal;
+                for (var i = nextHostIndex; i < writeClients.Length; i += readWriteTotal)
+                {
+                    if (writeClients[i] != null && !writeClients[i].Active && !writeClients[i].HadExceptions)
+                    {
+                        inactiveClient = writeClients[i];
+                        return i;
+                    }
+
+                    if (writeClients[i] == null)
+                    {
+                        writeClients[i] = reservedSlot;
+                        inactiveClient = null;
+                        return i;
+                    }
+
+                    if (writeClients[i] != reservedSlot && writeClients[i].HadExceptions)
+                    {
+                        inactiveClient = null;
+                        return i;
+                    }
+                }
+            }
+            inactiveClient = null;
+            return -1;
+        }
+
+        /// <summary>
+        /// Returns a ReadOnly client using the hosts defined in ReadOnlyHosts.
+        /// </summary>
+        /// <returns></returns>
+        public virtual IRedisClient GetReadOnlyClient()
+        {
+            try
+            {
+                var poolTimedOut = false;
+                var inactivePoolIndex = -1;
+                lock (readClients)
+                {
+                    AssertValidReadOnlyPool();
+
+                    RedisClient inActiveClient;
+                    while ((inactivePoolIndex = GetInActiveReadClient(out inActiveClient)) == -1)
+                    {
+                        if (PoolTimeout.HasValue)
+                        {
+                            // wait for a connection, break out if made to wait too long
+                            if (!Monitor.Wait(readClients, PoolTimeout.Value))
+                            {
+                                poolTimedOut = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            Monitor.Wait(readClients, RecheckPoolAfterMs);
+                        }
+                    }
+
+                    //inActiveClient != null only for Valid InActive Clients
+                    if (inActiveClient != null)
+                    {
+                        ReadPoolIndex++;
+                        inActiveClient.Active = true;
+
+                        InitClient(inActiveClient);
+
+                        return inActiveClient;
+                    }
+                }
+
+                if (poolTimedOut)
+                    throw new TimeoutException(PoolTimeoutError);
+
+                //Reaches here when there's no Valid InActive Clients
+                try
+                {
+                    //inactivePoolIndex = index of reservedSlot || index of invalid client
+                    var existingClient = readClients[inactivePoolIndex];
+                    if (existingClient != null && existingClient != reservedSlot && existingClient.HadExceptions)
+                    {
+                        RedisState.DeactivateClient(existingClient);
+                    }
+
+                    var newClient = InitNewClient(RedisResolver.CreateSlaveClient(inactivePoolIndex));
+
+                    //Put all blocking I/O or potential Exceptions before lock
+                    lock (readClients)
+                    {
+                        //If existingClient at inactivePoolIndex changed (failover) return new client outside of pool
+                        if (readClients[inactivePoolIndex] != existingClient)
+                        {
+                            if (Log.IsDebugEnabled)
+                                Log.Debug("readClients[inactivePoolIndex] != existingClient: {0}".Fmt(readClients[inactivePoolIndex]));
+
+                            Interlocked.Increment(ref RedisState.TotalClientsCreatedOutsidePool);
+
+                            //Don't handle callbacks for new client outside pool
+                            newClient.ClientManager = null;
+                            return newClient; //return client outside of pool
+                        }
+
+                        ReadPoolIndex++;
+                        readClients[inactivePoolIndex] = newClient;
+                        return newClient;
+                    }
+                }
+                catch
+                {
+                    //Revert free-slot for any I/O exceptions that can throw
+                    lock (readClients)
+                    {
+                        readClients[inactivePoolIndex] = null; //free slot
+                    }
+                    throw;
+                }
+            }
+            finally
+            {
+                RedisState.DisposeExpiredClients();
             }
         }
 
@@ -241,47 +447,54 @@ namespace ServiceStack.Redis
         /// Called within a lock
         /// </summary>
         /// <returns></returns>
-        private RedisClient GetInActiveWriteClient()
+        private int GetInActiveReadClient(out RedisClient inactiveClient)
         {
-            var desiredIndex = WritePoolIndex % writeClients.Length;
+            var desiredIndex = ReadPoolIndex % readClients.Length;
             //this will loop through all hosts in readClients once even though there are 2 for loops
             //both loops are used to try to get the prefered host according to the round robin algorithm
-            for (int x = 0; x < ReadWriteHosts.Count; x++)
+            var readOnlyTotal = RedisResolver.ReadOnlyHostsCount;
+            for (int x = 0; x < readOnlyTotal; x++)
             {
-                var nextHostIndex = (desiredIndex + x) % ReadWriteHosts.Count;
-                RedisEndpoint nextHost = ReadWriteHosts[nextHostIndex];
-                for (var i = nextHostIndex; i < writeClients.Length; i += ReadWriteHosts.Count)
+                var nextHostIndex = (desiredIndex + x) % readOnlyTotal;
+                for (var i = nextHostIndex; i < readClients.Length; i += readOnlyTotal)
                 {
-                    if (writeClients[i] != null && !writeClients[i].Active && !writeClients[i].HadExceptions)
-                        return writeClients[i];
-                    else if (writeClients[i] == null || writeClients[i].HadExceptions)
+                    if (readClients[i] != null && !readClients[i].Active && !readClients[i].HadExceptions)
                     {
-                        if (writeClients[i] != null)
-                            writeClients[i].DisposeConnection();
+                        inactiveClient = readClients[i];
+                        return i;
+                    }
 
-                        var client = InitNewClient(nextHost);
-                        writeClients[i] = client;
+                    if (readClients[i] == null)
+                    {
+                        readClients[i] = reservedSlot;
+                        inactiveClient = null;
+                        return i;
+                    }
 
-                        return client;
+                    if (readClients[i] != reservedSlot && readClients[i].HadExceptions)
+                    {
+                        inactiveClient = null;
+                        return i;
                     }
                 }
             }
-            return null;
+            inactiveClient = null;
+            return -1;
         }
 
-        private RedisClient InitNewClient(RedisEndpoint nextHost)
+        private RedisClient InitNewClient(RedisClient client)
         {
-            var client = RedisClientFactory.CreateRedisClient(nextHost);
             client.Id = Interlocked.Increment(ref RedisClientCounter);
+            client.Active = true;
             client.ClientManager = this;
             client.ConnectionFilter = ConnectionFilter;
             if (NamespacePrefix != null)
                 client.NamespacePrefix = NamespacePrefix;
 
-            return client;
+            return InitClient(client);
         }
 
-        private void InitClient(RedisClient client)
+        private RedisClient InitClient(RedisClient client)
         {
             if (this.ConnectTimeout != null)
                 client.ConnectTimeout = this.ConnectTimeout.Value;
@@ -295,73 +508,7 @@ namespace ServiceStack.Redis
                 client.NamespacePrefix = NamespacePrefix;
             if (Db != null && client.Db != Db) //Reset database to default if changed
                 client.ChangeDb(Db.Value);
-        }
-
-        /// <summary>
-        /// Returns a ReadOnly client using the hosts defined in ReadOnlyHosts.
-        /// </summary>
-        /// <returns></returns>
-        public virtual IRedisClient GetReadOnlyClient()
-        {
-            if (ReadOnlyHosts.Count == 0)
-                return this.GetClient();
-
-            lock (readClients)
-            {
-                AssertValidReadOnlyPool();
-
-                RedisClient inActiveClient;
-                while ((inActiveClient = GetInActiveReadClient()) == null)
-                {
-                    if (PoolTimeout.HasValue)
-                    {
-                        // wait for a connection, cry out if made to wait too long
-                        if (!Monitor.Wait(readClients, PoolTimeout.Value))
-                            throw new TimeoutException(PoolTimeoutError);
-                    }
-                    else
-                        Monitor.Wait(readClients, RecheckPoolAfterMs);
-                }
-
-                ReadPoolIndex++;
-                inActiveClient.Active = true;
-
-                InitClient(inActiveClient);
-
-                return inActiveClient;
-            }
-        }
-
-        /// <summary>
-        /// Called within a lock
-        /// </summary>
-        /// <returns></returns>
-        private RedisClient GetInActiveReadClient()
-        {
-            var desiredIndex = ReadPoolIndex % readClients.Length;
-            //this will loop through all hosts in readClients once even though there are 2 for loops
-            //both loops are used to try to get the prefered host according to the round robin algorithm
-            for (int x = 0; x < ReadOnlyHosts.Count; x++)
-            {
-                var nextHostIndex = (desiredIndex + x) % ReadOnlyHosts.Count;
-                var nextHost = ReadOnlyHosts[nextHostIndex];
-                for (var i = nextHostIndex; i < readClients.Length; i += ReadOnlyHosts.Count)
-                {
-                    if (readClients[i] != null && !readClients[i].Active && !readClients[i].HadExceptions)
-                        return readClients[i];
-                    else if (readClients[i] == null || readClients[i].HadExceptions)
-                    {
-                        if (readClients[i] != null)
-                            readClients[i].DisposeConnection();
-
-                        var client = InitNewClient(nextHost);
-                        readClients[i] = client;
-
-                        return client;
-                    }
-                }
-            }
-            return null;
+            return client;
         }
 
         public void DisposeClient(RedisNativeClient client)
@@ -499,6 +646,8 @@ namespace ServiceStack.Redis
 
             var ret = new Dictionary<string, string>
             {
+                {"VersionString", "" + Text.Env.VersionString},
+
                 {"writeClientsPoolSize", "" + writeClientsPoolSize},
                 {"writeClientsCreated", "" + writeClientsCreated},
                 {"writeClientsWithExceptions", "" + writeClientsWithExceptions},
@@ -510,6 +659,9 @@ namespace ServiceStack.Redis
                 {"readClientsWithExceptions", "" + readClientsWithExceptions},
                 {"readClientsInUse", "" + readClientsInUse},
                 {"readClientsConnected", "" + readClientsConnected},
+
+                {"RedisResolver.ReadOnlyHostsCount", "" + RedisResolver.ReadOnlyHostsCount},
+                {"RedisResolver.ReadWriteHostsCount", "" + RedisResolver.ReadWriteHostsCount},
             };
 
             return ret;
@@ -593,6 +745,8 @@ namespace ServiceStack.Redis
             {
                 Log.Error("Error when trying to dispose of PooledRedisClientManager", ex);
             }
+
+            RedisState.DisposeAllDeactivatedClients();
         }
 
         private int disposeAttempts = 0;

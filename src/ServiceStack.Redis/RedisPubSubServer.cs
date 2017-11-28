@@ -29,6 +29,7 @@ namespace ServiceStack.Redis
         public Action<string> OnUnSubscribe { get; set; }
         public Action<Exception> OnError { get; set; }
         public Action<IRedisPubSubServer> OnFailover { get; set; }
+        public bool IsSentinelSubscription { get; set; }
 
         readonly Random rand = new Random(Environment.TickCount);
 
@@ -62,8 +63,10 @@ namespace ServiceStack.Redis
             get { return Interlocked.CompareExchange(ref bgThreadCount, 0, 0); }
         }
 
+        public const string AllChannelsWildCard = "*";
         public IRedisClientsManager ClientsManager { get; set; }
         public string[] Channels { get; set; }
+        public string[] ChannelsMatching { get; set; }
         public TimeSpan? WaitBeforeNextRestart { get; set; }
 
         public RedisPubSubServer(IRedisClientsManager clientsManager, params string[] channels)
@@ -141,7 +144,9 @@ namespace ServiceStack.Redis
                 using (var redis = ClientsManager.GetReadOnlyClient())
                 {
                     startedAt = Stopwatch.StartNew();
-                    serverTimeAtStart = redis.GetServerTime();
+                    serverTimeAtStart = IsSentinelSubscription
+                        ? DateTime.UtcNow
+                        : redis.GetServerTime();
                 }
             }
             catch (Exception ex)
@@ -166,14 +171,15 @@ namespace ServiceStack.Redis
 
         void SendHeartbeat(object state)
         {
-            if (OnHeartbeatSent != null)
-                OnHeartbeatSent();
-
             var currentStatus = Interlocked.CompareExchange(ref status, 0, 0);
             if (currentStatus != Status.Started)
-            {
                 return;
-            }
+
+            if (DateTime.UtcNow - new DateTime(lastHeartbeatTicks) < HeartbeatInterval.Value)
+                return;
+
+            if (OnHeartbeatSent != null)
+                OnHeartbeatSent();
 
             NotifyAllSubscribers(ControlCommand.Pulse);
 
@@ -253,13 +259,21 @@ namespace ServiceStack.Redis
                                     switch (op)
                                     {
                                         case Operation.Stop:
-                                            Log.Debug("Stop Command Issued");
+                                            if (Log.IsDebugEnabled)
+                                                Log.Debug("Stop Command Issued");
 
-                                            if (Interlocked.CompareExchange(ref status, Status.Stopped, Status.Started) != Status.Started)
+                                            Interlocked.CompareExchange(ref status, Status.Stopping, Status.Started);
+                                            try
+                                            {
+                                                if (Log.IsDebugEnabled)
+                                                    Log.Debug("UnSubscribe From All Channels...");
+
+                                                subscription.UnSubscribeFromAllChannels(); //Un block thread.
+                                            }
+                                            finally
+                                            {
                                                 Interlocked.CompareExchange(ref status, Status.Stopped, Status.Stopping);
-
-                                            Log.Debug("UnSubscribe From All Channels...");
-                                            subscription.UnSubscribeFromAllChannels(); //Un block thread.
+                                            }
                                             return;
 
                                         case Operation.Reset:
@@ -280,7 +294,12 @@ namespace ServiceStack.Redis
                                 }
                             };
 
-                            subscription.SubscribeToChannels(Channels); //blocks thread
+                            //blocks thread
+                            if (ChannelsMatching != null && ChannelsMatching.Length > 0)
+                                subscription.SubscribeToChannelsMatching(ChannelsMatching);
+                            else
+                                subscription.SubscribeToChannels(Channels);             
+
                             masterClient = null;
                         }
                     }
@@ -439,7 +458,8 @@ namespace ServiceStack.Redis
                 rand.Next((int)Math.Pow(continuousErrorsCount, 3), (int)Math.Pow(continuousErrorsCount + 1, 3) + 1),
                 MaxSleepMs);
 
-            Log.Debug("Sleeping for {0}ms after {1} continuous errors".Fmt(nextTry, continuousErrorsCount));
+            if (Log.IsDebugEnabled)
+                Log.Debug("Sleeping for {0}ms after {1} continuous errors".Fmt(nextTry, continuousErrorsCount));
 
             Thread.Sleep(nextTry);
         }
@@ -504,7 +524,7 @@ namespace ServiceStack.Redis
 
         public string GetStatsDescription()
         {
-            var sb = new StringBuilder();
+            var sb = StringBuilderCache.Allocate();
             sb.AppendLine("===============");
             sb.AppendLine("Current Status: " + GetStatus());
             sb.AppendLine("Times Started: " + Interlocked.CompareExchange(ref timesStarted, 0, 0));
@@ -512,7 +532,7 @@ namespace ServiceStack.Redis
             sb.AppendLine("Num of Continuous Errors: " + Interlocked.CompareExchange(ref noOfContinuousErrors, 0, 0));
             sb.AppendLine("Last ErrorMsg: " + lastExMsg);
             sb.AppendLine("===============");
-            return sb.ToString();
+            return StringBuilderCache.ReturnAndFree(sb);
         }
 
         public virtual void Dispose()

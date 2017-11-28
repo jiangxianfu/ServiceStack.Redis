@@ -9,90 +9,90 @@ using ServiceStack.Text;
 
 namespace ServiceStack.Redis.Tests
 {
-    //[TestFixture]
-    //public class FreeLicenseUsageTests : LicenseUsageTests
-    //{
-    //    [SetUp]
-    //    public void SetUp()
-    //    {
-    //        LicenseUtils.RemoveLicense();
-    //        JsConfig.Reset();
-    //    }
+    [TestFixture]
+    public class FreeLicenseUsageTests : LicenseUsageTests
+    {
+        [SetUp]
+        public void SetUp()
+        {
+            LicenseUtils.RemoveLicense();
+            JsConfig.Reset();
+        }
 
-    //    [TearDown]
-    //    public void TearDown()
-    //    {
-    //        Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
-    //    }
+        [TearDown]
+        public void TearDown()
+        {
+            Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
+        }
 
-    //    [Test]
-    //    public void Allows_access_of_21_types()
-    //    {
-    //        Access20Types();
-    //        Access20Types();
-    //    }
+        [Test]
+        public void Allows_access_of_21_types()
+        {
+            Access20Types();
+            Access20Types();
+        }
 
-    //    [Test]
-    //    public void Throws_on_access_of_21_types()
-    //    {
-    //        using (var client = new RedisClient(TestConfig.SingleHost))
-    //        {
-    //            Access20Types();
-    //            Access20Types();
+        [Test]
+        public void Throws_on_access_of_21_types()
+        {
+            using (var client = new RedisClient(TestConfig.SingleHost))
+            {
+                Access20Types();
+                Access20Types();
 
-    //            Assert.Throws<LicenseException>(() =>
-    //                client.As<T21>());
-    //        }
-    //    }
+                Assert.Throws<LicenseException>(() =>
+                    client.As<T21>());
+            }
+        }
 
-    //    [Test, Explicit("Takes too long - but works!")]
-    //    public void Allows_access_of_6000_operations()
-    //    {
-    //        using (var client = new RedisClient(TestConfig.SingleHost))
-    //        {
-    //            6000.Times(() => client.Get("any key"));
-    //        }
-    //    }
+        [Test, Explicit("Takes too long - but works!")]
+        public void Allows_access_of_6000_operations()
+        {
+            using (var client = new RedisClient(TestConfig.SingleHost))
+            {
+                6000.Times(() => client.Get("any key"));
+            }
+        }
 
-    //    [Test, Explicit("Takes too long - but works!")]
-    //    public void Throws_on_access_of_6100_operations()
-    //    {
-    //        using (var client = new RedisClient(TestConfig.SingleHost))
-    //        {
-    //            Assert.Throws<LicenseException>(() =>
-    //                6100.Times(() => client.Get("any key")));
-    //        }
-    //    }
-    //}
+        [Test, Explicit("Takes too long - but works!")]
+        public void Throws_on_access_of_6100_operations()
+        {
+            using (var client = new RedisClient(TestConfig.SingleHost))
+            {
+                Assert.Throws<LicenseException>(() =>
+                    6100.Times(() => client.Get("any key")));
+            }
+        }
+    }
 
-    //[TestFixture]
-    //public class RegisteredLicenseUsageTests : LicenseUsageTests
-    //{
-    //    [Test]
-    //    public void Allows_access_of_21_types()
-    //    {
-    //        Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
+    [TestFixture]
+    public class RegisteredLicenseUsageTests : LicenseUsageTests
+    {
+        [Test]
+        public void Allows_access_of_21_types()
+        {
+            Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
 
-    //        using (var client = new RedisClient(TestConfig.SingleHost))
-    //        {
-    //            Access20Types();
-    //            Access20Types();
+            using (var client = new RedisClient(TestConfig.SingleHost))
+            {
+                Access20Types();
+                Access20Types();
 
-    //            client.As<T21>();
-    //        }
-    //    }
+                client.As<T21>();
+            }
+        }
 
-    //    [Test, Explicit("Takes too long - but works!")]
-    //    public void Allows_access_of_6100_operations()
-    //    {
-    //        Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
+        [Test, Explicit("Takes too long - but works!")]
+        public void Allows_access_of_6100_operations()
+        {
+            Licensing.RegisterLicense(new AppSettings().GetString("servicestack:license"));
 
-    //        using (var client = new RedisClient(TestConfig.SingleHost))
-    //        {
-    //            6100.Times(() => client.Get("any key"));
-    //        }
-    //    }
-    //}
+            using (var client = new RedisClient(TestConfig.SingleHost))
+            {
+                6100.Times(() => client.Get("any key"));
+            }
+        }
+    }
 
     class T01 { public int Id { get; set; } }
     class T02 { public int Id { get; set; } }

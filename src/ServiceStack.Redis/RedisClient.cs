@@ -12,10 +12,11 @@
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using ServiceStack.Caching;
+using System.Threading;
 using ServiceStack.Redis.Generic;
 using ServiceStack.Redis.Pipeline;
 using ServiceStack.Text;
@@ -40,6 +41,9 @@ namespace ServiceStack.Redis
         internal static HashSet<Type> __uniqueTypes = new HashSet<Type>();
 
         public static Func<RedisClient> NewFactoryFn = () => new RedisClient();
+
+        public static Func<object, Dictionary<string, string>> ConvertToHashFn =
+            x => x.ToJson().FromJson<Dictionary<string, string>>();
 
         /// <summary>
         /// Creates a new instance of the Redis Client from NewFactoryFn. 
@@ -67,7 +71,7 @@ namespace ServiceStack.Redis
             Init();
         }
 
-        public RedisClient(string host, int port, string password = null, long db = DefaultDb)
+        public RedisClient(string host, int port, string password = null, long db = RedisConfig.DefaultDb)
             : base(host, port, password, db)
         {
             Init();
@@ -135,7 +139,13 @@ namespace ServiceStack.Redis
             return SearchKeys("*");
         }
 
+        [Obsolete("Use SetValue()")]
         public void SetEntry(string key, string value)
+        {
+            SetValue(key, value);
+        }
+
+        public void SetValue(string key, string value)
         {
             var bytesValue = value != null
                 ? value.ToUtf8Bytes()
@@ -144,7 +154,27 @@ namespace ServiceStack.Redis
             base.Set(key, bytesValue);
         }
 
+        public bool SetValue(byte[] key, byte[] value, TimeSpan expireIn)
+        {
+            if (AssertServerVersionNumber() >= 2600)
+            {
+                Exec(r => r.Set(key, value, 0, expiryMs: (long)expireIn.TotalMilliseconds));
+            }
+            else
+            {
+                Exec(r => r.SetEx(key, (int)expireIn.TotalSeconds, value));
+            }
+
+            return true;
+        }
+
+        [Obsolete("Use SetValue()")]
         public void SetEntry(string key, string value, TimeSpan expireIn)
+        {
+            SetValue(key, value, expireIn);
+        }
+
+        public void SetValue(string key, string value, TimeSpan expireIn)
         {
             var bytesValue = value != null
                 ? value.ToUtf8Bytes()
@@ -163,14 +193,39 @@ namespace ServiceStack.Redis
             }
         }
 
+        [Obsolete("Use SetValueIfExists()")]
         public bool SetEntryIfExists(string key, string value)
+        {
+            return SetValueIfExists(key, value);
+        }
+
+        public bool SetValueIfExists(string key, string value)
         {
             var bytesValue = value != null ? value.ToUtf8Bytes() : null;
 
             return base.Set(key, bytesValue, exists: true);
         }
 
+        [Obsolete("Use SetValueIfNotExists()")]
+        public bool SetEntryIfNotExists(string key, string value)
+        {
+            return SetValueIfNotExists(key, value);
+        }
+
+        public bool SetValueIfNotExists(string key, string value)
+        {
+            var bytesValue = value != null ? value.ToUtf8Bytes() : null;
+
+            return base.Set(key, bytesValue, exists: false);
+        }
+
+        [Obsolete("Use SetValueIfExists()")]
         public bool SetEntryIfExists(string key, string value, TimeSpan expireIn)
+        {
+            return SetValueIfExists(key, value, expireIn);
+        }
+
+        public bool SetValueIfExists(string key, string value, TimeSpan expireIn)
         {
             var bytesValue = value != null ? value.ToUtf8Bytes() : null;
 
@@ -180,14 +235,13 @@ namespace ServiceStack.Redis
                 return base.Set(key, bytesValue, exists: true, expirySeconds: (int)expireIn.TotalSeconds);
         }
 
-        public bool SetEntryIfNotExists(string key, string value)
+        [Obsolete("Use SetValueIfNotExists()")]
+        public bool SetEntryIfNotExists(string key, string value, TimeSpan expireIn)
         {
-            var bytesValue = value != null ? value.ToUtf8Bytes() : null;
-
-            return base.Set(key, bytesValue, exists: false);
+            return SetValueIfNotExists(key, value, expireIn);
         }
 
-        public bool SetEntryIfNotExists(string key, string value, TimeSpan expireIn)
+        public bool SetValueIfNotExists(string key, string value, TimeSpan expireIn)
         {
             var bytesValue = value != null ? value.ToUtf8Bytes() : null;
 
@@ -197,16 +251,15 @@ namespace ServiceStack.Redis
                 return base.Set(key, bytesValue, exists: false, expirySeconds: (int)expireIn.TotalSeconds);
         }
 
-        public void ChangeDb(long db)
-        {
-            Db = db;
-            SendExpectSuccess(Commands.Select, db.ToUtf8Bytes());
-        }
-
         [Obsolete("Use GetClientsInfo")]
         public List<Dictionary<string, string>> GetClientList()
         {
             return GetClientsInfo();
+        }
+
+        public void SetValues(Dictionary<string, string> map)
+        {
+            SetAll(map);
         }
 
         public void SetAll(IEnumerable<string> keys, IEnumerable<string> values)
@@ -250,9 +303,7 @@ namespace ServiceStack.Redis
             base.MSet(keyBytes, valBytes);
         }
 
-        /// <summary>
-        /// Alias for GetValue
-        /// </summary>
+        [Obsolete("Use GetValue()")]
         public string GetEntry(string key)
         {
             return GetValue(key);
@@ -266,7 +317,13 @@ namespace ServiceStack.Redis
                 : bytes.FromUtf8Bytes();
         }
 
+        [Obsolete("Use GetAndSetValue()")]
         public string GetAndSetEntry(string key, string value)
+        {
+            return GetAndSetValue(key, value);
+        }
+
+        public string GetAndSetValue(string key, string value)
         {
             return GetSet(key, value.ToUtf8Bytes()).FromUtf8Bytes();
         }
@@ -277,6 +334,11 @@ namespace ServiceStack.Redis
         }
 
         public bool Remove(string key)
+        {
+            return Del(key) == Success;
+        }
+
+        public bool Remove(byte[] key)
         {
             return Del(key) == Success;
         }
@@ -328,12 +390,30 @@ namespace ServiceStack.Redis
             base.Rename(fromName, toName);
         }
 
+        public long GetStringCount(string key)
+        {
+            return base.StrLen(key);
+        }
+
         public string GetRandomKey()
         {
             return RandomKey();
         }
 
         public bool ExpireEntryIn(string key, TimeSpan expireIn)
+        {
+            if (AssertServerVersionNumber() >= 2600)
+            {
+                if (expireIn.Milliseconds > 0)
+                {
+                    return PExpire(key, (long)expireIn.TotalMilliseconds);
+                }
+            }
+
+            return Expire(key, (int)expireIn.TotalSeconds);
+        }
+
+        public bool ExpireEntryIn(byte[] key, TimeSpan expireIn)
         {
             if (AssertServerVersionNumber() >= 2600)
             {
@@ -380,7 +460,6 @@ namespace ServiceStack.Redis
             }
             catch (TypeInitializationException ex)
             {
-                //throw ex.GetInnerMostException();
                 throw ex;
             }
         }
@@ -683,10 +762,15 @@ namespace ServiceStack.Redis
             return GetAllEntriesFromHash(key).ToJson().FromJson<T>();
         }
 
+        /// <summary>
+        /// Store object fields as a dictionary of values in a Hash value.
+        /// Conversion to Dictionary can be customized with RedisClient.ConvertToHashFn
+        /// </summary>
         public void StoreAsHash<T>(T entity)
         {
             var key = UrnKey(entity);
-            SetRangeInHash(key, entity.ToJson().FromJson<Dictionary<string, string>>());
+            var hash = ConvertToHashFn(entity);
+            SetRangeInHash(key, hash);
             RegisterTypeId(entity);
         }
 
@@ -816,6 +900,53 @@ namespace ServiceStack.Redis
         #endregion
 
         #region LUA EVAL
+
+        static readonly ConcurrentDictionary<string, string> CachedLuaSha1Map =
+            new ConcurrentDictionary<string, string>();
+
+        public T ExecCachedLua<T>(string scriptBody, Func<string, T> scriptSha1)
+        {
+            string sha1;
+            if (!CachedLuaSha1Map.TryGetValue(scriptBody, out sha1))
+                CachedLuaSha1Map[scriptBody] = sha1 = LoadLuaScript(scriptBody);
+
+            try
+            {
+                return scriptSha1(sha1);
+            }
+            catch (RedisResponseException ex)
+            {
+                if (!ex.Message.StartsWith("NOSCRIPT"))
+                    throw;
+
+                CachedLuaSha1Map[scriptBody] = sha1 = LoadLuaScript(scriptBody);
+                return scriptSha1(sha1);
+            }
+        }
+
+        public RedisText ExecLua(string body, params string[] args)
+        {
+            var data = base.EvalCommand(body, 0, args.ToMultiByteArray());
+            return data.ToRedisText();
+        }
+
+        public RedisText ExecLua(string luaBody, string[] keys, string[] args)
+        {
+            var data = base.EvalCommand(luaBody, keys.Length, MergeAndConvertToBytes(keys, args));
+            return data.ToRedisText();
+        }
+
+        public RedisText ExecLuaSha(string sha1, params string[] args)
+        {
+            var data = base.EvalShaCommand(sha1, 0, args.ToMultiByteArray());
+            return data.ToRedisText();
+        }
+
+        public RedisText ExecLuaSha(string sha1, string[] keys, string[] args)
+        {
+            var data = base.EvalShaCommand(sha1, keys.Length, MergeAndConvertToBytes(keys, args));
+            return data.ToRedisText();
+        }
 
         public long ExecLuaAsInt(string body, params string[] args)
         {
@@ -1011,6 +1142,37 @@ namespace ServiceStack.Redis
             base.PfMerge(toKey, fromKeys);
         }
 
+        public RedisServerRole GetServerRole()
+        {
+            if (AssertServerVersionNumber() >= 2812)
+            {
+                var text = base.Role();
+                var roleName = text.Children[0].Text;
+                return ToServerRole(roleName);
+            }
+
+            string role;
+            this.Info.TryGetValue("role", out role);
+            return ToServerRole(role);
+        }
+
+        private static RedisServerRole ToServerRole(string roleName)
+        {
+            if (string.IsNullOrEmpty(roleName))
+                return RedisServerRole.Unknown;
+
+            switch (roleName)
+            {
+                case "master":
+                    return RedisServerRole.Master;
+                case "slave":
+                    return RedisServerRole.Slave;
+                case "sentinel":
+                    return RedisServerRole.Sentinel;
+                default:
+                    return RedisServerRole.Unknown;
+            }
+        }
     }
 
 }

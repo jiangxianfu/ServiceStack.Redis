@@ -153,11 +153,15 @@
   <ItemGroup>
     <Compile Include="BasicRedisClientManager.cs" />
     <Compile Include="BasicRedisClientManager.ICacheClient.cs" />
+    <Compile Include="BasicRedisResolver.cs" />
+    <Compile Include="RedisDataInfoExtensions.cs" />
+    <Compile Include="RedisResolver.cs" />
     <Compile Include="BufferPool.cs" />
     <Compile Include="Commands.cs" />
     <Compile Include="ConnectionUtils.cs" />
     <Compile Include="IHandleClientDispose.cs" />
-    <Compile Include="RedisManagerFactory.cs" />
+    <Compile Include="IRedisResolver.cs" />
+    <Compile Include="RedisClientExtensions.cs" />
     <Compile Include="RedisManagerPool.cs" />
     <Compile Include="RedisClient_Admin.cs" />
     <Compile Include="Generic\ManagedListGeneric.cs" />
@@ -166,7 +170,6 @@
     <Compile Include="Generic\RedisTypedClient_App.cs" />
     <Compile Include="Generic\RedisTypedPipeline.cs" />
     <Compile Include="Generic\RedisTypedCommandQueue.cs" />
-    <Compile Include="IRedisClientFactory.cs" />
     <Compile Include="IRedisFailover.cs" />
     <Compile Include="IRedisSentinel.cs" />
     <Compile Include="RedisClientManagerCacheClient.cs" />
@@ -179,7 +182,11 @@
     <Compile Include="RedisEndpoint.cs" />
     <Compile Include="RedisPubSubServer.cs" />
     <Compile Include="RedisSentinel.cs" />
+    <Compile Include="RedisSentinelResolver.cs" />
     <Compile Include="RedisSentinelWorker.cs" />
+    <Compile Include="RedisState.cs" />
+    <Compile Include="RedisStats.cs" />
+    <Compile Include="RedisRetryableException.cs" />
     <Compile Include="ScanResult.cs" />
     <Compile Include="ShardedConnectionPool.cs" />
     <Compile Include="ShardedRedisClientManager.cs" />
@@ -204,7 +211,6 @@
     <Compile Include="Support\Queue\Implementation\RedisSimpleWorkQueue.cs" />
     <Compile Include="Support\Queue\Implementation\RedisWorkQueue.cs" />
     <Compile Include="Support\Queue\Implementation\SerializingRedisClient.cs" />
-    <Compile Include="Support\Queue\Implementation\SerializingRedisClientFactory.cs" />
     <Compile Include="Pipeline\RedisAllPurposePipeline.cs" />
     <Compile Include="Generic\RedisClientHash.Generic.cs" />
     <Compile Include="Generic\RedisTypedTransaction.cs" />
@@ -223,12 +229,10 @@
     <Compile Include="Pipeline\RedisPipelineCommand.cs" />
     <Compile Include="RedisSubscription.cs" />
     <Compile Include="Transaction\RedisTransaction.cs" />
-    <Compile Include="RedisClientFactory.cs" />
     <Compile Include="Generic\RedisClientSet.Generic.cs" />
     <Compile Include="Generic\RedisClientList.Generic.cs" />
     <Compile Include="RedisClient.ICacheClient.cs" />
     <Compile Include="Generic\RedisTypedClient.cs" />
-    <Compile Include="RedisCacheClientFactory.cs" />
     <Compile Include="RedisClientManagerConfig.cs" />
     <Compile Include="RedisClientSet.cs" />
     <Compile Include="RedisClient.cs" />

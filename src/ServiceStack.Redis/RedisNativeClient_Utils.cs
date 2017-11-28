@@ -30,9 +30,15 @@ namespace ServiceStack.Redis
         private const string OK = "OK";
         private const string QUEUED = "QUEUED";
         //private static Timer UsageTimer;
+
         //private static int __requestsPerHour = 0;
+        //public static int RequestsPerHour
+        //{
+        //    get { return __requestsPerHour; }
+        //}
+
         private const int Unknown = -1;
-        public int ServerVersionNumber { get; set; }
+        public static int ServerVersionNumber { get; set; }
 
         public int AssertServerVersionNumber()
         {
@@ -42,18 +48,18 @@ namespace ServiceStack.Redis
             return ServerVersionNumber;
         }
 
-        //public static void DisposeTimers()
-        //{
-        //    if (UsageTimer == null) return;
-        //    try
-        //    {
-        //        UsageTimer.Dispose();
-        //    }
-        //    finally
-        //    {
-        //        UsageTimer = null;
-        //    }
-        //}
+        public static void DisposeTimers()
+        {
+            //if (UsageTimer == null) return;
+            //try
+            //{
+            //    UsageTimer.Dispose();
+            //}
+            //finally
+            //{
+            //    UsageTimer = null;
+            //}
+        }
 
         private void Connect()
         {
@@ -69,13 +75,14 @@ namespace ServiceStack.Redis
             //    }
             //}
 
-            socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) {
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+            {
                 SendTimeout = SendTimeout,
                 ReceiveTimeout = ReceiveTimeout
             };
             try
             {
-                if (ConnectTimeout == 0)
+                if (ConnectTimeout <= 0)
                 {
                     socket.Connect(Host, Port);
                 }
@@ -89,7 +96,7 @@ namespace ServiceStack.Redis
                 {
                     socket.Close();
                     socket = null;
-                    HadExceptions = true;
+                    DeactivatedAt = DateTime.UtcNow;
                     return;
                 }
 
@@ -132,27 +139,31 @@ namespace ServiceStack.Redis
 
                 Bstream = new BufferedStream(networkStream, 16 * 1024);
 
-                if (Password != null)
-                    SendExpectSuccess(Commands.Auth, Password.ToUtf8Bytes());
+                if (!string.IsNullOrEmpty(Password))
+                    SendUnmanagedExpectSuccess(Commands.Auth, Password.ToUtf8Bytes());
 
                 if (db != 0)
-                    SendExpectSuccess(Commands.Select, db.ToUtf8Bytes());
+                    SendUnmanagedExpectSuccess(Commands.Select, db.ToUtf8Bytes());
 
                 if (Client != null)
-                    SendExpectSuccess(Commands.Client, Commands.SetName, Client.ToUtf8Bytes());
+                    SendUnmanagedExpectSuccess(Commands.Client, Commands.SetName, Client.ToUtf8Bytes());
 
                 try
                 {
                     if (ServerVersionNumber == 0)
                     {
-                        var parts = ServerVersion.Split('.');
-                        var version = int.Parse(parts[0])*1000;
-                        if (parts.Length > 1)
-                            version += int.Parse(parts[1])*100;
-                        if (parts.Length > 2)
-                            version += int.Parse(parts[2]);
+                        ServerVersionNumber = RedisConfig.AssumeServerVersion.GetValueOrDefault(0);
+                        if (ServerVersionNumber <= 0)
+                        {
+                            var parts = ServerVersion.Split('.');
+                            var version = int.Parse(parts[0]) * 1000;
+                            if (parts.Length > 1)
+                                version += int.Parse(parts[1]) * 100;
+                            if (parts.Length > 2)
+                                version += int.Parse(parts[2]);
 
-                        ServerVersionNumber = version;
+                            ServerVersionNumber = version;
+                        }
                     }
                 }
                 catch (Exception)
@@ -163,7 +174,7 @@ namespace ServiceStack.Redis
                     Connect();
                     return;
                 }
-                    
+
                 var ipEndpoint = socket.LocalEndPoint as IPEndPoint;
                 clientPort = ipEndpoint != null ? ipEndpoint.Port : -1;
                 lastCommand = null;
@@ -177,18 +188,14 @@ namespace ServiceStack.Redis
                     ConnectionFilter(this);
                 }
             }
-            catch (SocketException ex)
+            catch (SocketException)
             {
-                if (socket != null)
-                    socket.Close();
-                socket = null;
-
-                HadExceptions = true;
-                var throwEx = new RedisException("could not connect to redis Instance at " + Host + ":" + Port, ex);
-                log.Error(throwEx.Message, ex);
-                throw throwEx;
+                log.Error(ErrorConnect.Fmt(Host, Port));
+                throw;
             }
         }
+
+        public static string ErrorConnect = "Could not connect to redis Instance at {0}:{1}";
 
         public virtual void OnConnected()
         {
@@ -196,7 +203,7 @@ namespace ServiceStack.Redis
 
         protected string ReadLine()
         {
-            var sb = new StringBuilder();
+            var sb = StringBuilderCache.Allocate();
 
             int c;
             while ((c = Bstream.ReadByte()) != -1)
@@ -207,7 +214,12 @@ namespace ServiceStack.Redis
                     break;
                 sb.Append((char)c);
             }
-            return sb.ToString();
+            return StringBuilderCache.ReturnAndFree(sb);
+        }
+
+        public bool HasConnected
+        {
+            get { return socket != null; }
         }
 
         public bool IsSocketConnected()
@@ -219,6 +231,31 @@ namespace ServiceStack.Redis
 
         internal bool AssertConnectedSocket()
         {
+            try
+            {
+                TryConnectIfNeeded();
+                var isConnected = socket != null;
+                return isConnected;
+            }
+            catch (SocketException ex)
+            {
+                log.Error(ErrorConnect.Fmt(Host, Port));
+
+                if (socket != null)
+                    socket.Close();
+
+                socket = null;
+
+                DeactivatedAt = DateTime.UtcNow;
+                var message = Host + ":" + Port;
+                var throwEx = new RedisException(message, ex);
+                log.Error(throwEx.Message, ex);
+                throw throwEx;
+            }
+        }
+
+        private void TryConnectIfNeeded()
+        {
             if (LastConnectedAtTimestamp > 0)
             {
                 var now = Stopwatch.GetTimestamp();
@@ -226,7 +263,7 @@ namespace ServiceStack.Redis
 
                 if (socket == null || (elapsedSecs > IdleTimeOutSecs && !socket.IsConnected()))
                 {
-                    return Reconnect();
+                    Reconnect();
                 }
                 LastConnectedAtTimestamp = now;
             }
@@ -235,10 +272,6 @@ namespace ServiceStack.Redis
             {
                 Connect();
             }
-
-            var isConnected = socket != null;
-
-            return isConnected;
         }
 
         private bool Reconnect()
@@ -248,43 +281,55 @@ namespace ServiceStack.Redis
             SafeConnectionClose();
             Connect(); //sets db to 0
 
-            if (previousDb != DefaultDb) this.Db = previousDb;
+            if (previousDb != RedisConfig.DefaultDb) this.Db = previousDb;
 
             return socket != null;
         }
 
-        private bool HandleSocketException(SocketException ex)
-        {
-            HadExceptions = true;
-            log.Error("SocketException: ", ex);
-
-            lastSocketException = ex;
-
-            // timeout?
-            socket.Close();
-            socket = null;
-
-            return false;
-        }
-
         private RedisResponseException CreateResponseError(string error)
         {
-            HadExceptions = true;
-            string safeLastCommand = (Password == null) ? lastCommand : lastCommand.Replace(Password, "");
+            DeactivatedAt = DateTime.UtcNow;
 
-            var throwEx = new RedisResponseException(
-                string.Format("{0}, sPort: {1}, LastCommand: {2}",
+            if (!RedisConfig.DisableVerboseLogging)
+            {
+                var safeLastCommand = string.IsNullOrEmpty(Password)
+                    ? lastCommand
+                    : (lastCommand ?? "").Replace(Password, "");
+
+                if (!string.IsNullOrEmpty(safeLastCommand))
+                    error = string.Format("{0}, LastCommand:'{1}', srcPort:{2}", error, safeLastCommand, clientPort);
+            }
+
+            var throwEx = new RedisResponseException(error);
+            log.Error(error);
+            return throwEx;
+        }
+
+        private RedisRetryableException CreateNoMoreDataError()
+        {
+            Reconnect();
+            return CreateRetryableResponseError("No more data");
+        }
+
+        private RedisRetryableException CreateRetryableResponseError(string error)
+        {
+            string safeLastCommand = string.IsNullOrEmpty(Password) ? lastCommand : (lastCommand ?? "").Replace(Password, "");
+
+            var throwEx = new RedisRetryableException(string.Format("[{0}] {1}, sPort: {2}, LastCommand: {3}",
+                    DateTime.UtcNow.ToString("HH:mm:ss.fff"),
                     error, clientPort, safeLastCommand));
             log.Error(throwEx.Message);
             throw throwEx;
         }
 
-        private RedisException CreateConnectionError()
+        private RedisException CreateConnectionError(Exception originalEx)
         {
-            HadExceptions = true;
-            var throwEx = new RedisException(
-                string.Format("Unable to Connect: sPort: {0}",
-                    clientPort), lastSocketException);
+            DeactivatedAt = DateTime.UtcNow;
+            var throwEx = new RedisException(string.Format("[{0}] Unable to Connect: sPort: {1}{2}",
+                    DateTime.UtcNow.ToString("HH:mm:ss.fff"),
+                    clientPort,
+                    originalEx != null ? ", Error: " + originalEx.Message + "\n" + originalEx.StackTrace : ""),
+                originalEx ?? lastSocketException);
             log.Error(throwEx.Message);
             throw throwEx;
         }
@@ -311,25 +356,38 @@ namespace ServiceStack.Redis
         /// </summary>
         /// <param name="cmdWithBinaryArgs"></param>
         /// <returns></returns>
-        protected bool SendCommand(params byte[][] cmdWithBinaryArgs)
+        protected void WriteCommandToSendBuffer(params byte[][] cmdWithBinaryArgs)
         {
-            if (!AssertConnectedSocket()) return false;
+            //if (Pipeline == null && Transaction == null)
+            //{
+            //    //Interlocked.Increment(ref __requestsPerHour);
+            //    //if (__requestsPerHour % 20 == 0)
+            //    //    LicenseUtils.AssertValidUsage(LicenseFeature.Redis, QuotaType.RequestsPerHour, __requestsPerHour);
+            //}
 
-            //Interlocked.Increment(ref __requestsPerHour);
-            //if (__requestsPerHour % 20 == 0)
-            //    LicenseUtils.AssertValidUsage(LicenseFeature.Redis, QuotaType.RequestsPerHour, __requestsPerHour);
-
-            if (log.IsDebugEnabled)
+            if (log.IsDebugEnabled && !RedisConfig.DisableVerboseLogging)
                 CmdLog(cmdWithBinaryArgs);
 
             //Total command lines count
             WriteAllToSendBuffer(cmdWithBinaryArgs);
+        }
 
-            //pipeline will handle flush, if pipelining is turned on
-            if (Pipeline == null)
-                return FlushSendBuffer();
+        /// <summary>
+        /// Send command outside of managed Write Buffer
+        /// </summary>
+        /// <param name="cmdWithBinaryArgs"></param>
+        protected void SendUnmanagedExpectSuccess(params byte[][] cmdWithBinaryArgs)
+        {
+            var bytes = GetCmdBytes('*', cmdWithBinaryArgs.Length);
 
-            return true;
+            foreach (var safeBinaryValue in cmdWithBinaryArgs)
+            {
+                bytes = bytes.Combine(GetCmdBytes('$', safeBinaryValue.Length), safeBinaryValue, endData);
+            }
+
+            Bstream.Write(bytes, 0, bytes.Length);
+
+            ExpectSuccess();
         }
 
         public void WriteAllToSendBuffer(params byte[][] cmdWithBinaryArgs)
@@ -344,7 +402,7 @@ namespace ServiceStack.Redis
             }
         }
 
-        readonly System.Collections.Generic.IList<ArraySegment<byte>> cmdBuffer = new System.Collections.Generic.List<ArraySegment<byte>>();
+        readonly IList<ArraySegment<byte>> cmdBuffer = new List<ArraySegment<byte>>();
         byte[] currentBuffer = BufferPool.GetBuffer();
         int currentBufferIndex;
 
@@ -359,7 +417,7 @@ namespace ServiceStack.Redis
             var bytesCopied = 0;
             while (bytesCopied < cmdBytes.Length)
             {
-                var copyOfBytes = BufferPool.GetBuffer();
+                var copyOfBytes = BufferPool.GetBuffer(cmdBytes.Length);
                 var bytesToCopy = Math.Min(cmdBytes.Length - bytesCopied, copyOfBytes.Length);
                 Buffer.BlockCopy(cmdBytes, bytesCopied, copyOfBytes, 0, bytesToCopy);
                 cmdBuffer.Add(new ArraySegment<byte>(copyOfBytes, 0, bytesToCopy));
@@ -369,7 +427,7 @@ namespace ServiceStack.Redis
 
         private bool CouldAddToCurrentBuffer(byte[] cmdBytes)
         {
-            if (cmdBytes.Length + currentBufferIndex < BufferPool.BufferLength)
+            if (cmdBytes.Length + currentBufferIndex < RedisConfig.BufferLength)
             {
                 Buffer.BlockCopy(cmdBytes, 0, currentBuffer, currentBufferIndex, cmdBytes.Length);
                 currentBufferIndex += cmdBytes.Length;
@@ -385,12 +443,23 @@ namespace ServiceStack.Redis
             currentBufferIndex = 0;
         }
 
-        public bool FlushSendBuffer()
+        public Action OnBeforeFlush { get; set; }
+
+        internal void FlushAndResetSendBuffer()
         {
-            try
+            FlushSendBuffer();
+            ResetSendBuffer();
+        }
+
+        internal void FlushSendBuffer()
+        {
+            if (currentBufferIndex > 0)
+                PushCurrentBuffer();
+
+            if (cmdBuffer.Count > 0)
             {
-                if (currentBufferIndex > 0)
-                    PushCurrentBuffer();
+                if (OnBeforeFlush != null)
+                    OnBeforeFlush();
 
                 if (!Env.IsMono && sslStream == null)
                 {
@@ -412,23 +481,7 @@ namespace ServiceStack.Redis
                         }
                     }
                 }
-                ResetSendBuffer();
             }
-            catch (IOException ex)  // several stream commands wrap SocketException in IOException
-            {
-                var socketEx = ex.InnerException as SocketException;
-                if (socketEx == null)
-                    throw;
-
-                cmdBuffer.Clear();
-                return HandleSocketException(socketEx);
-            }
-            catch (SocketException ex)
-            {
-                cmdBuffer.Clear();
-                return HandleSocketException(ex);
-            }
-            return true;
         }
 
         /// <summary>
@@ -450,43 +503,211 @@ namespace ServiceStack.Redis
             return Bstream.ReadByte();
         }
 
+        protected T SendReceive<T>(byte[][] cmdWithBinaryArgs,
+            Func<T> fn,
+            Action<Func<T>> completePipelineFn = null,
+            bool sendWithoutRead = false)
+        {
+            var i = 0;
+            Exception originalEx = null;
+
+            var firstAttempt = DateTime.UtcNow;
+
+            while (true)
+            {
+                try
+                {
+                    TryConnectIfNeeded();
+
+                    if (socket == null)
+                        throw new RedisRetryableException("Socket is not connected");
+
+                    if (i == 0) //only write to buffer once
+                        WriteCommandToSendBuffer(cmdWithBinaryArgs);
+
+                    if (Pipeline == null) //pipeline will handle flush if in pipeline
+                    {
+                        FlushSendBuffer();
+                    }
+                    else if (!sendWithoutRead)
+                    {
+                        if (completePipelineFn == null)
+                            throw new NotSupportedException("Pipeline is not supported.");
+
+                        completePipelineFn(fn);
+                        return default(T);
+                    }
+
+                    var result = default(T);
+                    if (fn != null)
+                        result = fn();
+
+                    if (Pipeline == null)
+                        ResetSendBuffer();
+
+                    if (i > 0)
+                        Interlocked.Increment(ref RedisState.TotalRetrySuccess);
+
+                    Interlocked.Increment(ref RedisState.TotalCommandsSent);
+
+                    return result;
+                }
+                catch (Exception outerEx)
+                {
+                    var retryableEx = outerEx as RedisRetryableException;
+                    if (retryableEx == null && outerEx is RedisException)
+                    {
+                        ResetSendBuffer();
+                        throw;
+                    }
+
+                    var ex = retryableEx ?? GetRetryableException(outerEx);
+                    if (ex == null)
+                        throw CreateConnectionError(originalEx ?? outerEx);
+
+                    if (originalEx == null)
+                        originalEx = ex;
+
+                    var retry = DateTime.UtcNow - firstAttempt < retryTimeout;
+                    if (!retry)
+                    {
+                        if (Pipeline == null)
+                            ResetSendBuffer();
+
+                        Interlocked.Increment(ref RedisState.TotalRetryTimedout);
+                        throw CreateRetryTimeoutException(retryTimeout, originalEx);
+                    }
+
+                    Interlocked.Increment(ref RedisState.TotalRetryCount);
+                    Thread.Sleep(GetBackOffMultiplier(++i));
+                }
+            }
+        }
+
+        private RedisException CreateRetryTimeoutException(TimeSpan retryTimeout, Exception originalEx)
+        {
+            DeactivatedAt = DateTime.UtcNow;
+            var message = "Exceeded timeout of {0}".Fmt(retryTimeout);
+            log.Error(message);
+            return new RedisException(message, originalEx);
+        }
+
+        private Exception GetRetryableException(Exception outerEx)
+        {
+            // several stream commands wrap SocketException in IOException
+            var socketEx = outerEx.InnerException as SocketException
+                ?? outerEx as SocketException;
+
+            if (socketEx == null)
+                return null;
+
+            log.Error("SocketException in SendReceive, retrying...", socketEx);
+            lastSocketException = socketEx;
+
+            if (socket != null)
+                socket.Close();
+
+            socket = null;
+            return socketEx;
+        }
+
+        private static int GetBackOffMultiplier(int i)
+        {
+            var nextTryMs = (2 ^ i) * RedisConfig.BackOffMultiplier;
+            return nextTryMs;
+        }
+
+        protected void SendWithoutRead(params byte[][] cmdWithBinaryArgs)
+        {
+            SendReceive<long>(cmdWithBinaryArgs, null, null, sendWithoutRead: true);
+        }
+
         protected void SendExpectSuccess(params byte[][] cmdWithBinaryArgs)
         {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
+            //Turn Action into Func Hack
+            var completePipelineFn = Pipeline != null
+                ? f => { Pipeline.CompleteVoidQueuedCommand(() => f()); }
+            : (Action<Func<long>>)null;
 
-            if (Pipeline != null)
-            {
-                Pipeline.CompleteVoidQueuedCommand(ExpectSuccess);
-                return;
-            }
-            ExpectSuccess();
+            SendReceive(cmdWithBinaryArgs, ExpectSuccessFn, completePipelineFn);
         }
 
         protected long SendExpectLong(params byte[][] cmdWithBinaryArgs)
         {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                Pipeline.CompleteLongQueuedCommand(ReadInt);
-                return default(long);
-            }
-            return ReadLong();
+            return SendReceive(cmdWithBinaryArgs, ReadLong, Pipeline != null ? Pipeline.CompleteLongQueuedCommand : (Action<Func<long>>)null);
         }
-		        
+
         protected byte[] SendExpectData(params byte[][] cmdWithBinaryArgs)
         {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
+            return SendReceive(cmdWithBinaryArgs, ReadData, Pipeline != null ? Pipeline.CompleteBytesQueuedCommand : (Action<Func<byte[]>>)null);
+        }
 
-            if (Pipeline != null)
+        protected double SendExpectDouble(params byte[][] cmdWithBinaryArgs)
+        {
+            return SendReceive(cmdWithBinaryArgs, ReadDouble, Pipeline != null ? Pipeline.CompleteDoubleQueuedCommand : (Action<Func<double>>)null);
+        }
+
+        protected string SendExpectCode(params byte[][] cmdWithBinaryArgs)
+        {
+            return SendReceive(cmdWithBinaryArgs, ExpectCode, Pipeline != null ? Pipeline.CompleteStringQueuedCommand : (Action<Func<string>>)null);
+        }
+
+        protected byte[][] SendExpectMultiData(params byte[][] cmdWithBinaryArgs)
+        {
+            return SendReceive(cmdWithBinaryArgs, ReadMultiData, Pipeline != null ? Pipeline.CompleteMultiBytesQueuedCommand : (Action<Func<byte[][]>>)null)
+                ?? TypeConstants.EmptyByteArrayArray;
+        }
+
+        protected object[] SendExpectDeeplyNestedMultiData(params byte[][] cmdWithBinaryArgs)
+        {
+            return SendReceive(cmdWithBinaryArgs, ReadDeeplyNestedMultiData);
+        }
+
+        protected RedisData SendExpectComplexResponse(params byte[][] cmdWithBinaryArgs)
+        {
+            return SendReceive(cmdWithBinaryArgs, ReadComplexResponse, Pipeline != null ? Pipeline.CompleteRedisDataQueuedCommand : (Action<Func<RedisData>>)null);
+        }
+
+        protected List<Dictionary<string, string>> SendExpectStringDictionaryList(params byte[][] cmdWithBinaryArgs)
+        {
+            var results = SendExpectComplexResponse(cmdWithBinaryArgs);
+            var to = new List<Dictionary<string, string>>();
+            foreach (var data in results.Children)
             {
-                Pipeline.CompleteBytesQueuedCommand(ReadData);
-                return null;
+                if (data.Children != null)
+                {
+                    var map = ToDictionary(data);
+                    to.Add(map);
+                }
             }
-            return ReadData();
+            return to;
+        }
+
+        private static Dictionary<string, string> ToDictionary(RedisData data)
+        {
+            string key = null;
+            var map = new Dictionary<string, string>();
+
+            if (data.Children == null)
+                throw new ArgumentNullException("data.Children");
+
+            for (var i = 0; i < data.Children.Count; i++)
+            {
+                var bytes = data.Children[i].Data;
+                if (i % 2 == 0)
+                {
+                    key = bytes.FromUtf8Bytes();
+                }
+                else
+                {
+                    if (key == null)
+                        throw new RedisResponseException("key == null, i={0}, data.Children[i] = {1}".Fmt(i, data.Children[i].ToRedisText().Dump()));
+
+                    var val = bytes.FromUtf8Bytes();
+                    map[key] = val;
+                }
+            }
+            return map;
         }
 
         protected string SendExpectString(params byte[][] cmdWithBinaryArgs)
@@ -495,97 +716,17 @@ namespace ServiceStack.Redis
             return bytes.FromUtf8Bytes();
         }
 
-        protected double SendExpectDouble(params byte[][] cmdWithBinaryArgs)
-        {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                Pipeline.CompleteDoubleQueuedCommand(ReadDouble);
-                return Double.NaN;
-            }
-
-            return ReadDouble();
-        }
-
-        public double ReadDouble()
-        {
-            var bytes = ReadData();
-            return (bytes == null) ? double.NaN : ParseDouble(bytes);
-        }
-
-        public static double ParseDouble(byte[] doubleBytes)
-        {
-            var doubleString = Encoding.UTF8.GetString(doubleBytes);
-
-            double d;
-            double.TryParse(doubleString, NumberStyles.Any, CultureInfo.InvariantCulture.NumberFormat, out d);
-
-            return d;
-        }
-
-        protected string SendExpectCode(params byte[][] cmdWithBinaryArgs)
-        {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                Pipeline.CompleteStringQueuedCommand(ExpectCode);
-                return null;
-            }
-
-            return ExpectCode();
-        }
-
-        protected byte[][] SendExpectMultiData(params byte[][] cmdWithBinaryArgs)
-        {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                Pipeline.CompleteMultiBytesQueuedCommand(ReadMultiData);
-                return new byte[0][];
-            }
-            return ReadMultiData();
-        }
-
-        protected object[] SendExpectDeeplyNestedMultiData(params byte[][] cmdWithBinaryArgs)
-        {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                throw new NotSupportedException("Pipeline is not supported.");
-            }
-
-            return ReadDeeplyNestedMultiData();
-        }
-
-        protected RedisData SendExpectComplexResponse(params byte[][] cmdWithBinaryArgs)
-        {
-            if (!SendCommand(cmdWithBinaryArgs))
-                throw CreateConnectionError();
-
-            if (Pipeline != null)
-            {
-                throw new NotSupportedException("Pipeline is not supported.");
-            }
-
-            return ReadComplexResponse();
-        }
-
         protected void Log(string fmt, params object[] args)
         {
+            if (RedisConfig.DisableVerboseLogging)
+                return;
+
             log.DebugFormat("{0}", string.Format(fmt, args).Trim());
         }
 
         protected void CmdLog(byte[][] args)
         {
-            var sb = new StringBuilder();
+            var sb = StringBuilderCache.Allocate();
             foreach (var arg in args)
             {
                 var strArg = arg.FromUtf8Bytes();
@@ -593,26 +734,33 @@ namespace ServiceStack.Redis
 
                 if (sb.Length > 0)
                     sb.Append(" ");
-                
+
                 sb.Append(strArg);
 
                 if (sb.Length > 100)
                     break;
             }
-            this.lastCommand = sb.ToString();
+            this.lastCommand = StringBuilderCache.ReturnAndFree(sb);
             if (this.lastCommand.Length > 100)
             {
                 this.lastCommand = this.lastCommand.Substring(0, 100) + "...";
             }
-            
+
             log.Debug("S: " + this.lastCommand);
+        }
+
+        //Turn Action into Func Hack
+        protected long ExpectSuccessFn()
+        {
+            ExpectSuccess();
+            return 0;
         }
 
         protected void ExpectSuccess()
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
 
@@ -627,7 +775,7 @@ namespace ServiceStack.Redis
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
 
@@ -645,7 +793,7 @@ namespace ServiceStack.Redis
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
 
@@ -668,34 +816,11 @@ namespace ServiceStack.Redis
             ExpectWord(QUEUED);
         }
 
-		public long ReadInt()
-        {
-            int c = SafeReadByte();
-            if (c == -1)
-                throw CreateResponseError("No more data");
-
-            var s = ReadLine();
-
-            if (log.IsDebugEnabled)
-                Log("R: {0}", s);
-
-            if (c == '-')
-                throw CreateResponseError(s.StartsWith("ERR") ? s.Substring(4) : s);
-
-            if (c == ':' || c == '$')//really strange why ZRANK needs the '$' here
-            {
-                int i;
-                if (int.TryParse(s, out i))
-                    return i;
-            }
-            throw CreateResponseError("Unknown reply on integer response: " + c + s);
-        }
-
         public long ReadLong()
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
 
@@ -712,6 +837,22 @@ namespace ServiceStack.Redis
                     return i;
             }
             throw CreateResponseError("Unknown reply on integer response: " + c + s);
+        }
+
+        public double ReadDouble()
+        {
+            var bytes = ReadData();
+            return (bytes == null) ? double.NaN : ParseDouble(bytes);
+        }
+
+        public static double ParseDouble(byte[] doubleBytes)
+        {
+            var doubleString = Encoding.UTF8.GetString(doubleBytes);
+
+            double d;
+            double.TryParse(doubleString, NumberStyles.Any, CultureInfo.InvariantCulture.NumberFormat, out d);
+
+            return d;
         }
 
         private byte[] ReadData()
@@ -737,7 +878,7 @@ namespace ServiceStack.Redis
                     return null;
                 int count;
 
-                if (Int32.TryParse(r.Substring(1), out count))
+                if (int.TryParse(r.Substring(1), out count))
                 {
                     var retbuf = new byte[count];
 
@@ -772,7 +913,7 @@ namespace ServiceStack.Redis
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
             if (log.IsDebugEnabled)
@@ -796,7 +937,7 @@ namespace ServiceStack.Redis
                         if (count == -1)
                         {
                             //redis is in an invalid state
-                            return new byte[0][];
+                            return TypeConstants.EmptyByteArrayArray;
                         }
 
                         var result = new byte[count][];
@@ -814,14 +955,15 @@ namespace ServiceStack.Redis
 
         private object[] ReadDeeplyNestedMultiData()
         {
-            return (object[])ReadDeeplyNestedMultiDataItem();
+            var result = ReadDeeplyNestedMultiDataItem();
+            return (object[])result;
         }
 
         private object ReadDeeplyNestedMultiDataItem()
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
             if (log.IsDebugEnabled)
@@ -860,7 +1002,7 @@ namespace ServiceStack.Redis
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
             if (log.IsDebugEnabled)
@@ -869,8 +1011,9 @@ namespace ServiceStack.Redis
             switch (c)
             {
                 case '$':
-                    return new RedisData {
-                        Data = ParseSingleLine(string.Concat(char.ToString((char) c), s))
+                    return new RedisData
+                    {
+                        Data = ParseSingleLine(string.Concat(char.ToString((char)c), s))
                     };
 
                 case '-':
@@ -901,7 +1044,7 @@ namespace ServiceStack.Redis
         {
             int c = SafeReadByte();
             if (c == -1)
-                throw CreateResponseError("No more data");
+                throw CreateNoMoreDataError();
 
             var s = ReadLine();
             if (log.IsDebugEnabled)
@@ -1004,7 +1147,7 @@ namespace ServiceStack.Redis
             for (var i = 0; i < keys.Length; i++)
             {
                 var key = keys[i];
-                keyBytes[i] = key != null ? key.ToUtf8Bytes() : new byte[0];
+                keyBytes[i] = key != null ? key.ToUtf8Bytes() : TypeConstants.EmptyByteArray;
             }
             return keyBytes;
         }
@@ -1012,9 +1155,9 @@ namespace ServiceStack.Redis
         protected byte[][] MergeAndConvertToBytes(string[] keys, string[] args)
         {
             if (keys == null)
-                keys = new string[0];
+                keys = TypeConstants.EmptyStringArray;
             if (args == null)
-                args = new string[0];
+                args = TypeConstants.EmptyStringArray;
 
             var keysLength = keys.Length;
             var merged = new string[keysLength + args.Length];
@@ -1035,7 +1178,7 @@ namespace ServiceStack.Redis
             return SendExpectLong(cmdArgs);
         }
 
-		public long EvalShaInt(string sha1, int numberKeysInArgs, params byte[][] keys)
+        public long EvalShaInt(string sha1, int numberKeysInArgs, params byte[][] keys)
         {
             if (sha1 == null)
                 throw new ArgumentNullException("sha1");
@@ -1078,6 +1221,24 @@ namespace ServiceStack.Redis
 
             var cmdArgs = MergeCommandWithArgs(Commands.EvalSha, sha1.ToUtf8Bytes(), keys.PrependInt(numberKeysInArgs));
             return SendExpectMultiData(cmdArgs);
+        }
+
+        public RedisData EvalCommand(string luaBody, int numberKeysInArgs, params byte[][] keys)
+        {
+            if (luaBody == null)
+                throw new ArgumentNullException("luaBody");
+
+            var cmdArgs = MergeCommandWithArgs(Commands.Eval, luaBody.ToUtf8Bytes(), keys.PrependInt(numberKeysInArgs));
+            return RawCommand(cmdArgs);
+        }
+
+        public RedisData EvalShaCommand(string sha1, int numberKeysInArgs, params byte[][] keys)
+        {
+            if (sha1 == null)
+                throw new ArgumentNullException("sha1");
+
+            var cmdArgs = MergeCommandWithArgs(Commands.EvalSha, sha1.ToUtf8Bytes(), keys.PrependInt(numberKeysInArgs));
+            return RawCommand(cmdArgs);
         }
 
         public string CalculateSha1(string luaBody)

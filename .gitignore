@@ -34,10 +34,15 @@ obj/
 _ReSharper*/
 [Tt]est[Rr]esult*
 App_Data/
+.vs/
 
 NuGet/
 NuGet.Signed/
+packages/
 *.pfx
 
 build/
 tests/ServiceStack.Redis.Tests/azureconfig.txt
+*.rdb
+*.dat
+*.rdb

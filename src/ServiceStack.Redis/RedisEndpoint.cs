@@ -1,5 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Text;
 using ServiceStack.IO;
+using ServiceStack.Text;
 
 namespace ServiceStack.Redis
 {
@@ -7,19 +11,18 @@ namespace ServiceStack.Redis
     {
         public RedisEndpoint()
         {
-            Host = RedisNativeClient.DefaultHost;
-            Port = RedisNativeClient.DefaultPort;
-            Db = RedisNativeClient.DefaultDb;
-            //个性化定制
-            //ConnectTimeout = 0;
-            //姜贤富 设置timeout--2015-02-12
-            ConnectTimeout = 100;
-            SendTimeout = -1;
-            ReceiveTimeout = -1;
-            IdleTimeOutSecs = RedisNativeClient.DefaultIdleTimeOutSecs;
+            Host = RedisConfig.DefaultHost;
+            Port = RedisConfig.DefaultPort;
+            Db = RedisConfig.DefaultDb;
+
+            ConnectTimeout = RedisConfig.DefaultConnectTimeout;
+            SendTimeout = RedisConfig.DefaultSendTimeout;
+            ReceiveTimeout = RedisConfig.DefaultReceiveTimeout;
+            RetryTimeout = RedisConfig.DefaultRetryTimeout;
+            IdleTimeOutSecs = RedisConfig.DefaultIdleTimeOutSecs;
         }
 
-        public RedisEndpoint(string host, int port, string password = null, long db = RedisNativeClient.DefaultDb)
+        public RedisEndpoint(string host, int port, string password = null, long db = RedisConfig.DefaultDb)
             : this()
         {
             this.Host = host;
@@ -34,12 +37,46 @@ namespace ServiceStack.Redis
         public int ConnectTimeout { get; set; }
         public int SendTimeout { get; set; }
         public int ReceiveTimeout { get; set; }
+        public int RetryTimeout { get; set; }
         public int IdleTimeOutSecs { get; set; }
         public long Db { get; set; }
         public string Client { get; set; }
         public string Password { get; set; }
         public bool RequiresAuth { get { return !string.IsNullOrEmpty(Password); } }
         public string NamespacePrefix { get; set; }
+
+        public override string ToString()
+        {
+            var sb = StringBuilderCache.Allocate();
+            sb.AppendFormat("{0}:{1}", Host, Port);
+
+            var args = new List<string>();
+            if (Client != null)
+                args.Add("Client=" + Client);
+            if (Password != null)
+                args.Add("Password=" + Password);
+            if (Db != RedisConfig.DefaultDb)
+                args.Add("Db=" + Db);
+            if (Ssl)
+                args.Add("Ssl=true");
+            if (ConnectTimeout != RedisConfig.DefaultConnectTimeout)
+                args.Add("ConnectTimeout=" + ConnectTimeout);
+            if (SendTimeout != RedisConfig.DefaultSendTimeout)
+                args.Add("SendTimeout=" + SendTimeout);
+            if (ReceiveTimeout != RedisConfig.DefaultReceiveTimeout)
+                args.Add("ReceiveTimeout=" + ReceiveTimeout);
+            if (RetryTimeout != RedisConfig.DefaultRetryTimeout)
+                args.Add("RetryTimeout=" + RetryTimeout);
+            if (IdleTimeOutSecs != RedisConfig.DefaultIdleTimeOutSecs)
+                args.Add("IdleTimeOutSecs=" + IdleTimeOutSecs);
+            if (NamespacePrefix != null)
+                args.Add("NamespacePrefix=" + NamespacePrefix.UrlEncode());
+
+            if (args.Count > 0)
+                sb.Append("?").Append(string.Join("&", args));
+            
+            return StringBuilderCache.ReturnAndFree(sb);
+        }
 
         protected bool Equals(RedisEndpoint other)
         {
@@ -49,6 +86,7 @@ namespace ServiceStack.Redis
                 && ConnectTimeout == other.ConnectTimeout 
                 && SendTimeout == other.SendTimeout 
                 && ReceiveTimeout == other.ReceiveTimeout 
+                && RetryTimeout == other.RetryTimeout
                 && IdleTimeOutSecs == other.IdleTimeOutSecs 
                 && Db == other.Db 
                 && string.Equals(Client, other.Client) 
@@ -74,6 +112,7 @@ namespace ServiceStack.Redis
                 hashCode = (hashCode * 397) ^ ConnectTimeout;
                 hashCode = (hashCode * 397) ^ SendTimeout;
                 hashCode = (hashCode * 397) ^ ReceiveTimeout;
+                hashCode = (hashCode * 397) ^ RetryTimeout;
                 hashCode = (hashCode * 397) ^ IdleTimeOutSecs;
                 hashCode = (hashCode * 397) ^ Db.GetHashCode();
                 hashCode = (hashCode * 397) ^ (Client != null ? Client.GetHashCode() : 0);
